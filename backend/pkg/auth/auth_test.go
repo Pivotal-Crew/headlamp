@@ -1579,3 +1579,90 @@ func TestHandleMe_MissingCookie(t *testing.T) {
 	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
 	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
 }
+
+func meRequest(t *testing.T, token string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	return req
+}
+
+func TestHandleMe_OpaqueTokenUsesLookupIdentity(t *testing.T) {
+	t.Parallel()
+
+	var gotToken string
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		LookupIdentity: func(r *http.Request, token string) (*auth.MeIdentity, int, error) {
+			gotToken = token
+			return &auth.MeIdentity{Username: "doks-admin", Groups: []string{"system:masters"}}, http.StatusOK, nil
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	handler(rr, meRequest(t, "dop_v1_opaque0123456789"))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "dop_v1_opaque0123456789", gotToken)
+
+	var got struct {
+		Username string   `json:"username"`
+		Groups   []string `json:"groups"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "doks-admin", got.Username)
+	assert.Equal(t, []string{"system:masters"}, got.Groups)
+}
+
+func TestHandleMe_OpaqueTokenLookupStatusIsPassedThrough(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusNotFound, http.StatusServiceUnavailable} {
+		handler := auth.HandleMe(auth.MeHandlerOptions{
+			LookupIdentity: func(r *http.Request, token string) (*auth.MeIdentity, int, error) {
+				return nil, status, errors.New("lookup failed")
+			},
+		})
+
+		rr := httptest.NewRecorder()
+		handler(rr, meRequest(t, "opaque-token"))
+
+		assert.Equal(t, status, rr.Code)
+	}
+}
+
+func TestHandleMe_JWTDoesNotUseLookupIdentity(t *testing.T) {
+	t.Parallel()
+
+	token := makeTestToken(t, map[string]interface{}{
+		"preferred_username": "alice",
+		"exp":                float64(time.Now().Add(time.Hour).Unix()),
+	})
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		LookupIdentity: func(r *http.Request, token string) (*auth.MeIdentity, int, error) {
+			t.Fatal("LookupIdentity must not be called for a JWT")
+			return nil, http.StatusInternalServerError, nil
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	handler(rr, meRequest(t, token))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), `"username":"alice"`)
+}
+
+func TestHandleMe_OpaqueTokenWithoutLookupIsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	rr := httptest.NewRecorder()
+	auth.HandleMe(auth.MeHandlerOptions{})(rr, meRequest(t, "opaque-token"))
+
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
+}

@@ -430,6 +430,31 @@ type MeHandlerOptions struct {
 	ProxyAuthUsernameHeader string
 	ProxyAuthGroupHeader    string
 	ProxyAuthEmailHeader    string
+	// LookupIdentity, when set, resolves the caller of a token that is not a JWT
+	// (an opaque bearer token, such as a cloud provider's cluster token) by asking
+	// the cluster's API server. Those tokens carry no claims to decode, so without
+	// it /me can only answer 401, which the frontend treats as a sign-out even
+	// though the API server accepts the token.
+	LookupIdentity IdentityLookup
+}
+
+// MeIdentity is the caller as the Kubernetes API server reports it.
+type MeIdentity struct {
+	Username string
+	Groups   []string
+}
+
+// IdentityLookup resolves the caller of a bearer token for the cluster in the
+// request. It returns the identity, or an HTTP status and error: 401 only when
+// the API server rejected the token itself.
+type IdentityLookup func(r *http.Request, token string) (*MeIdentity, int, error)
+
+// isJWT reports whether a bearer token has the three-part shape of a JWT whose
+// claims /me can decode.
+func isJWT(token string) bool {
+	parts := strings.SplitN(token, ".", 3)
+
+	return len(parts) == 3 && parts[1] != ""
 }
 
 // HandleMe returns a handler that reads the per-cluster auth cookie and responds with user info.
@@ -471,6 +496,11 @@ func HandleMe(opts MeHandlerOptions) http.HandlerFunc {
 			return
 		}
 
+		if !isJWT(token) && opts.LookupIdentity != nil {
+			writeLookedUpIdentity(w, r, token, opts.LookupIdentity, userInfoURL)
+			return
+		}
+
 		claims, status, errMsg := parseClaimsFromToken(token)
 		if status != 0 {
 			writeMeJSON(w, status, map[string]interface{}{errFieldMessage: errMsg})
@@ -488,6 +518,20 @@ func HandleMe(opts MeHandlerOptions) http.HandlerFunc {
 
 		writeMeResponse(w, username, email, groups, userInfoURL)
 	}
+}
+
+// writeLookedUpIdentity answers /me for an opaque token from the API server's
+// view of its caller, passing the lookup's status through on failure.
+func writeLookedUpIdentity(w http.ResponseWriter, r *http.Request, token string, lookup IdentityLookup,
+	userInfoURL string,
+) {
+	identity, status, err := lookup(r, token)
+	if err != nil {
+		writeMeJSON(w, status, map[string]interface{}{errFieldMessage: err.Error()})
+		return
+	}
+
+	writeMeResponse(w, identity.Username, "", identity.Groups, userInfoURL)
 }
 
 // parseClaimsFromToken extracts the JWT claims from a token.
