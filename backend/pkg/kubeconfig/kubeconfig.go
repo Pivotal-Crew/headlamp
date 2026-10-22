@@ -529,6 +529,15 @@ func (c *Context) SetupProxy() error {
 		}
 	}
 
+	// Let the transport resend request bodies when the API server closes an
+	// HTTP/2 connection (GOAWAY) mid-request; see makeBodyReplayable.
+	baseTransport := proxy.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+
+	proxy.Transport = replayableBodyRoundTripper{base: baseTransport}
+
 	c.proxy = proxy
 
 	logger.Log(logger.LevelInfo, map[string]string{"context": c.Name, "clusterURL": c.Cluster.Server},
